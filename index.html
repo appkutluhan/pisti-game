@@ -263,6 +263,13 @@
       .deck-visual, .pile { width: 88px; }
     }
     @media (prefers-reduced-motion: reduce) { *,*::before,*::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+
+    /* Premium cinematic card movement */
+    .flying-card { position:fixed!important; z-index:9999!important; pointer-events:none!important; margin:0!important; transform-origin:center; will-change:transform,opacity; filter:drop-shadow(0 12px 16px #0008); }
+    .pile.capture-focus .pile-layer:last-child .card { box-shadow:0 0 0 3px #f8d477,0 0 25px #ffd65b99!important; }
+    .capture-indicator { position:fixed; z-index:10002; pointer-events:none; padding:9px 15px; border-radius:100px; background:#102e27; border:1px solid #f4d57d; color:#ffe39b; font-weight:850; font-size:13px; box-shadow:0 10px 28px #0009; white-space:nowrap; transform:translate(-50%,-50%); animation:capPop .22s ease-out both; }
+    @keyframes capPop { from { opacity:0; scale:.8 } to { opacity:1; scale:1 } }
+    .player-hand.animating button { pointer-events:none; }
   </style>
 </head>
 <body>
@@ -316,6 +323,9 @@
     let draftMode = state?.mode || 2;
     let draftTarget = state?.target || 101;
     let aiTimer = null, summaryTimer = null, hintTimer = null, audioContext = null;
+    let moveBusy=false, visualEpoch=0;
+    const wait = ms => new Promise(resolve=>setTimeout(resolve,ms));
+    const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
     function suitOf(card) { return SUITS.find(s => s.id === card.suit) || SUITS[0]; }
     function shownRank(rank) { return ({J:'V', Q:'D', K:'R'})[rank] || rank; }
@@ -405,7 +415,7 @@
       state.dealNumber=(state.dealNumber||0)+1;
     }
     function startRound() {
-      clearTimeout(aiTimer); clearTimeout(summaryTimer);
+      clearTimeout(aiTimer); clearTimeout(summaryTimer); visualEpoch++; moveBusy=false;
       const deck=newDeck();
       const initial=Array.from({length:4},()=>deck.pop());
       state.deck=deck;
@@ -421,17 +431,112 @@
       state.phase='playing';
       state.roundSummary=null;
       dealHands();
-      save(); render(); scheduleAI();
+      save(); render();
+      moveBusy=true; dealAnimation().finally(()=>{moveBusy=false;scheduleAI();});
     }
     function startMatch() {
-      clearTimeout(aiTimer); clearTimeout(summaryTimer);
+      clearTimeout(aiTimer); clearTimeout(summaryTimer); visualEpoch++; moveBusy=false;
       state={mode:draftMode,target:draftTarget,sound:state?.sound!==false,round:1,scores:[0,0],roundHistory:[],matchRecorded:false,phase:'playing',speed:'normal'};
       $('overlayRoot').innerHTML='';
       $('toastRoot').innerHTML='';
       startRound();
       sound('deal');
     }
-    function playCard(player,cardId) {
+    function flight(element, destination, duration=650, endScale=1) {
+      if (!element || !destination || reducedMotion()) return Promise.resolve();
+      const from=element.getBoundingClientRect(), to=destination.getBoundingClientRect();
+      const clone=element.cloneNode(true);
+      clone.classList.add('flying-card');
+      clone.style.cssText+=`;left:${from.left}px;top:${from.top}px;width:${from.width}px;height:${from.height}px;`;
+      document.body.appendChild(clone);
+      const dx=to.left+to.width/2-from.left-from.width/2;
+      const dy=to.top+to.height/2-from.top-from.height/2;
+      const scale=Math.min(to.width/from.width,to.height/from.height)*endScale;
+      const motion=clone.animate([
+        {transform:'translate(0,0) rotate(-5deg) scale(1)',opacity:1},
+        {transform:`translate(${dx*.48}px,${dy*.43-35}px) rotate(5deg) scale(${(1+scale)/2})`,opacity:1,offset:.55},
+        {transform:`translate(${dx}px,${dy}px) rotate(0deg) scale(${scale})`,opacity:1}
+      ],{duration,easing:'cubic-bezier(.25,.7,.25,1)',fill:'forwards'});
+      return motion.finished.catch(()=>{}).then(()=>clone.remove());
+    }
+    async function dealAnimation() {
+      if (reducedMotion() || !state || state.phase!=='playing') return;
+      const epoch=visualEpoch;
+      const deck=$('deckVisual').querySelector('.card') || $('deckVisual');
+      const targets=[$('playerHand'),$('seatRight'),$('seatTop'),$('seatLeft')];
+      const jobs=[];
+      for(let r=0;r<4;r++) for(let p=0;p<state.mode;p++) {
+        const target=targets[p];
+        const card=target?.querySelectorAll('.card')[r] || target?.querySelector('.card');
+        if(card) jobs.push({target:card,delay:(r*state.mode+p)*105});
+      }
+      for(const job of jobs) {
+        if(epoch!==visualEpoch) return;
+        const ghost=deck?.cloneNode(true);
+        if(!ghost) return;
+        ghost.classList.add('flying-card');
+        const a=deck.getBoundingClientRect(),b=job.target.getBoundingClientRect();
+        ghost.style.cssText+=`;left:${a.left}px;top:${a.top}px;width:${a.width}px;height:${a.height}px;`;
+        document.body.appendChild(ghost);
+        ghost.animate([{transform:'translate(0,0) scale(.85)',opacity:.9},{transform:`translate(${b.left+b.width/2-a.left-a.width/2}px,${b.top+b.height/2-a.top-a.height/2}px) scale(${b.width/a.width})`,opacity:0}],{duration:480,easing:'ease-in-out',fill:'forwards'}).finished.catch(()=>{}).then(()=>ghost.remove());
+        await wait(105);
+      }
+      await wait(350);
+    }
+    async function animatedPlayCard(player,cardId) {
+      if(moveBusy || !state || state.phase!=='playing' || state.turn!==player) return false;
+      const card=state.hands[player]?.find(c=>c.id===cardId);
+      if(!card) return false;
+      moveBusy=true;
+      const top=state.table.at(-1), capture=!!top&&(top.rank===card.rank||card.rank==='J');
+      const isPisti=capture&&state.table.length===1&&top.rank===card.rank;
+      const src=player===0?$('playerHand').querySelector(`[data-card-id="${cardId}"]`):
+        (player===1&&state.mode===4?$('seatRight'):player===2?$('seatTop'):player===3?$('seatLeft'):$('seatTop')).querySelector('.card');
+      const destination=$('tablePile').querySelector('.pile-layer:last-child .card') || $('tablePile');
+      const label=document.createElement('div');
+      try {
+        $('playerHand').classList.add('animating');
+        if(src) src.style.visibility='hidden';
+        const face=document.createElement('div'); face.innerHTML=cardFace(card);
+        const flyer=face.firstElementChild;
+        if(src && !reducedMotion()) {
+          const rect=src.getBoundingClientRect();
+          flyer.style.cssText+=`;position:fixed;left:${rect.left}px;top:${rect.top}px;width:${rect.width}px;height:${rect.height}px;z-index:9999;pointer-events:none`;
+          document.body.appendChild(flyer);
+          const dst=destination.getBoundingClientRect();
+          const dx=dst.left+dst.width/2-rect.left-rect.width/2,dy=dst.top+dst.height/2-rect.top-rect.height/2;
+          await flyer.animate([{transform:'translate(0,0) rotate(-9deg)'},{transform:`translate(${dx*.5}px,${dy*.5-40}px) rotate(7deg)`,offset:.55},{transform:`translate(${dx}px,${dy}px) rotate(0deg)`}],{duration:680,easing:'cubic-bezier(.25,.7,.25,1)',fill:'forwards'}).finished.catch(()=>{});
+          flyer.remove();
+        }
+        if(capture) {
+          // Show the exact card responsible before sweeping the pile away.
+          $('tablePile').classList.add('capture-focus');
+          label.className='capture-indicator';
+          label.textContent=isPisti?`${cardShort(card)} + ${cardShort(top)} · PİŞTİ!`:`${cardShort(card)} ile ${cardShort(top)} alındı`;
+          const rect=$('tablePile').getBoundingClientRect();
+          label.style.left=`${rect.left+rect.width/2}px`;label.style.top=`${Math.max(28,rect.top-24)}px`;
+          document.body.appendChild(label);
+          const shown=document.createElement('div');
+          shown.innerHTML=cardFace(card);
+          const visible=shown.firstElementChild;
+          visible.classList.add('flying-card');
+          visible.style.cssText+=`;left:${rect.left+rect.width/2-35}px;top:${rect.top+rect.height/2-50}px;width:70px;height:100px;`;
+          document.body.appendChild(visible);
+          await wait(reducedMotion()?150:950);
+          if(!reducedMotion()) await visible.animate([{transform:'translate(0,0) scale(1)',opacity:1},{transform:`translate(${player===0?0:player===2?0:player===1?180:-180}px,${player===0?220:-150}px) scale(.35)`,opacity:0}],{duration:460,easing:'ease-in',fill:'forwards'}).finished.catch(()=>{});
+          visible.remove();
+        } else await wait(reducedMotion()?0:160);
+        const wasDeal=state.hands.every((h,i)=>i===player?h.length===1:h.length===0)&&state.deck.length>0;
+        const result=commitPlayCard(player,cardId);
+        if(wasDeal && state.phase==='playing') await dealAnimation();
+        return result;
+      } finally {
+        label.remove();$('tablePile').classList.remove('capture-focus');$('playerHand').classList.remove('animating');
+        moveBusy=false;
+        if(state?.phase==='playing') scheduleAI();
+      }
+    }
+    function commitPlayCard(player,cardId) {
       if (!state || state.phase!=='playing' || state.turn!==player) return false;
       const hand=state.hands[player], cardIndex=hand.findIndex(c=>c.id===cardId);
       if (cardIndex<0) return false;
@@ -470,8 +575,8 @@
         }
       }
       save(); render();
-      if (state.phase==='playing') scheduleAI();
-      else { clearTimeout(summaryTimer); summaryTimer=setTimeout(openRoundSummary,900); }
+      if (state.phase==='playing' && !moveBusy) scheduleAI();
+      else if(state.phase!=='playing') { clearTimeout(summaryTimer); summaryTimer=setTimeout(openRoundSummary,900); }
       return true;
     }
     function scoreTeam(team) {
@@ -529,11 +634,11 @@
     }
     function scheduleAI() {
       clearTimeout(aiTimer);
-      if (!state || state.phase!=='playing' || state.turn===0) return;
+      if (moveBusy || !state || state.phase!=='playing' || state.turn===0) return;
       aiTimer=setTimeout(()=>{
         if(!state || state.phase!=='playing' || state.turn===0) return;
         const p=state.turn, card=chooseAICard(p);
-        if(card) playCard(p,card.id);
+        if(card) animatedPlayCard(p,card.id);
       },state.speed==='fast'?400:850);
     }
     function sound(type) {
@@ -638,7 +743,7 @@
     }
     $('playerHand').addEventListener('click',e=>{
       const btn=e.target.closest('button[data-card-id]');
-      if(btn) playCard(0,btn.dataset.cardId);
+      if(btn) animatedPlayCard(0,btn.dataset.cardId);
     });
     $('rulesBtn').addEventListener('click',openRules);
     $('menuBtn').addEventListener('click',openMenu);
@@ -665,7 +770,7 @@
     document.addEventListener('keydown',e=>{
       if(e.key==='Escape' && $('overlayRoot').innerHTML && state) { closeModal(); if(state.phase==='playing') scheduleAI(); }
       if(e.key>='1' && e.key<='4' && !$('overlayRoot').innerHTML && state?.turn===0 && state?.phase==='playing') {
-        const card=state.hands[0][Number(e.key)-1]; if(card) playCard(0,card.id);
+        const card=state.hands[0][Number(e.key)-1]; if(card) animatedPlayCard(0,card.id);
       }
     });
     render();
